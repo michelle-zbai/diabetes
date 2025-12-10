@@ -7,6 +7,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from openai import OpenAI
+import json, os, re
+from datetime import datetime
 
 st.set_page_config(page_title="Diabetes Risk Checker", page_icon="🩺", layout="centered")
 st.title("🩺 Diabetes Risk Checker")
@@ -191,6 +193,45 @@ Return as numbered list 0..{len(years)-1}, no extra commentary.
     except Exception as e:
         return None, 'api_error', str(e)
 
+# --- Monitoring & feedback helpers ---
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "events.jsonl")
+
+def log_event(kind: str, payload: dict):
+    """Append a JSON event; best-effort, no crash on failure."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        event = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "kind": kind,
+            "payload": payload,
+        }
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
+
+PUBMED_RE = re.compile(r"https?://pubmed\.ncbi\.nlm\.nih\.gov/\d+/?$", re.IGNORECASE)
+DOI_RE = re.compile(r"https?://doi\.org/10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+
+def validate_links(text: str):
+    """Return counts of plausible PubMed/DOI links."""
+    urls = re.findall(r"https?://\S+", text or "")
+    pubmed_ok = [u for u in urls if PUBMED_RE.match(u)]
+    doi_ok = [u for u in urls if DOI_RE.match(u)]
+    return {
+        "total": len(urls),
+        "pubmed_ok": len(pubmed_ok),
+        "doi_ok": len(doi_ok),
+    }
+
+SAFEWORDS = ["dosing", "dose", "prescription", "off-label"]
+
+def safety_check(text: str):
+    """Very light heuristic safety screen for potentially sensitive directives."""
+    found = [w for w in SAFEWORDS if w in (text or "").lower()]
+    return found
+
 # Always show input form
 st.write("### Enter Your Health Information")
 col1, col2 = st.columns(2)
@@ -356,6 +397,17 @@ if st.session_state['show_results'] and 'inputs' in st.session_state:
         for item in decorate_suggestions(llm_content):
             st.markdown(item)
 
+        # Lightweight safety/logging
+        triggers = safety_check(llm_content)
+        log_event("llm_suggestion", {
+            "has_diabetes": has_diabetes,
+            "diabetes_type": diabetes_type,
+            "risk_pct": risk_pct,
+            "safety_flags": triggers,
+        })
+        if triggers:
+            st.caption("⚠️ Please review with your clinician; automated content flagged for sensitive terms.")
+
         # Add visual health metrics
         st.write("#### 📊 Your Health Metrics")
         col_m1, col_m2, col_m3 = st.columns(3)
@@ -389,6 +441,20 @@ if st.session_state['show_results'] and 'inputs' in st.session_state:
 
         if llm_error == 'no_key':
             st.info("💡 Add your OpenAI API key to `.streamlit/secrets.toml` for AI-powered personalized suggestions!")
+
+    # Feedback widget for suggestions
+    fb_col1, fb_col2 = st.columns([1,2])
+    feedback_choice = fb_col1.radio("Was this helpful?", ["👍", "👎"], index=0, key="fb_suggestions")
+    feedback_reason = fb_col2.selectbox("Why?", ["Specific and useful", "Too generic", "Not applicable", "Safety concern", "Other"], index=0, key="fb_suggestions_reason")
+    if st.button("Submit feedback", key="fb_suggestions_btn"):
+        log_event("feedback_suggestions", {
+            "choice": feedback_choice,
+            "reason": feedback_reason,
+            "has_diabetes": has_diabetes,
+            "diabetes_type": diabetes_type,
+            "risk_pct": risk_pct,
+        })
+        st.success("Thanks for your feedback! It helps improve recommendations.")
 
     # Save to session history for trend visualization (only if not already diagnosed)
     if not has_diabetes:
@@ -547,12 +613,38 @@ Format as Markdown bullet points with clickable links like: [Study Title](https:
     
     if journal_content:
         st.markdown(journal_content)
+        link_stats = validate_links(journal_content)
+        log_event("journal_recs", {
+            "has_diabetes": has_diabetes,
+            "diabetes_type": diabetes_type,
+            "risk_pct": risk_pct,
+            "links_total": link_stats["total"],
+            "links_pubmed_ok": link_stats["pubmed_ok"],
+            "links_doi_ok": link_stats["doi_ok"],
+        })
+        if link_stats["total"] > 0 and (link_stats["pubmed_ok"] + link_stats["doi_ok"]) < link_stats["total"]:
+            st.caption("⚠️ Some links may not match PubMed/DOI patterns. Please verify before use.")
     elif journal_error == 'api_error':
         st.warning("Unable to retrieve journal recommendations at this time.")
         if journal_error_msg:
             st.caption(f"Error details: {journal_error_msg}")
     elif journal_error == 'no_key':
         st.info("📖 Configure OpenAI API key to receive peer-reviewed research recommendations.")
+
+    # Feedback widget for research
+    fb_r1, fb_r2 = st.columns([1,2])
+    fb_j_choice = fb_r1.radio("Are these articles relevant?", ["👍", "👎"], index=0, key="fb_journal")
+    fb_j_reason = fb_r2.selectbox("Why?", ["Relevant to my type", "Links broken", "Too generic", "Not applicable", "Other"], index=0, key="fb_journal_reason")
+    if st.button("Submit research feedback", key="fb_journal_btn"):
+        log_event("feedback_journal", {
+            "choice": fb_j_choice,
+            "reason": fb_j_reason,
+            "has_diabetes": has_diabetes,
+            "diabetes_type": diabetes_type,
+            "risk_pct": risk_pct,
+            "link_stats": link_stats if journal_content else None,
+        })
+        st.success("Thanks for your feedback on the research links.")
 
     # Connect with professionals / forum-style guidance
     st.markdown("<br><br>", unsafe_allow_html=True)
